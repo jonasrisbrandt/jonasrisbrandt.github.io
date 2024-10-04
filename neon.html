@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>WebGL 2D Pixel Shader Animation (WebGL2)</title>
+    <style>
+        body, html {
+            margin: 0;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="glCanvas"></canvas>
+
+    <!-- Vertex Shader -->
+    <script id="vertexShader" type="x-shader/x-vertex">
+        #version 300 es
+        in vec2 a_position;
+        out vec2 v_position;
+
+        void main() {
+            v_position = a_position;
+            gl_Position = vec4(a_position, 0.0, 1.0);
+        }
+    </script>
+
+    <!-- Fragment Shader (animated color effect) -->
+    <script id="fragmentShader" type="x-shader/x-fragment">
+        #version 300 es
+        precision mediump float;
+        in vec2 v_position;
+        uniform vec2 u_resolution;
+        uniform float u_time;
+        out vec4 outColor;
+
+        vec3 palette(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
+            return a + b * cos(6.28318*(c*t*d));
+        }
+
+        vec3 palette_fixed(float t) {
+            vec3 a = vec3(0.5, 0.5, 0.5);
+            vec3 b = vec3(0.5, 0.5, 0.5);
+            vec3 c = vec3(1.0, 1.0, 1.0);
+            vec3 d = vec3(0.263, 0.416, 0.557);
+            return a + b * cos(6.28318*(c*t*d));
+        }
+
+        vec2 rot2d(vec2 v, float angle) {
+            float cosa = cos(angle);
+            float sina = sin(angle);
+            
+            mat2 rotation = mat2(
+                cosa, -sina,
+                sina,  cosa
+            );
+            
+            return rotation * v;
+        }
+
+        void main() {
+
+            // v_position are (-1.0 to 1.0)
+            vec2 uv = v_position;
+            uv.x *= u_resolution.x / u_resolution.y;
+
+            float angle = u_time * 0.05 * sin(u_time * 0.1);
+            uv = rot2d(uv, angle);
+
+            vec2 uv0 = uv;
+            float d0 = length(uv0);
+            vec3 finalColor = vec3(0.0);
+
+            for (float i = 0.0; i<5.0; i++) {
+                uv = fract(uv * 1.4 * abs(sin(u_time * 0.1))) - 0.5;
+    
+                float d = length(uv) * exp(-length(d0));
+                
+                vec3 col = palette_fixed(length(d0) + i * 0.4 + u_time * 0.4);
+    
+                d = sin(d*8.0 + u_time)/8.0;
+                d = abs(d);
+                d = pow(0.007 / d, 1.8);
+    
+                finalColor += col * d;
+            }
+
+            outColor = vec4(finalColor, 1.0);
+        }
+    </script>
+
+    <script type="text/javascript">
+        // Get the canvas element
+        const canvas = document.getElementById('glCanvas');
+
+        // Set the canvas to full window size
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        // Initialize the WebGL2 context
+        const gl = canvas.getContext('webgl2');
+
+        if (!gl) {
+            console.error('WebGL2 not supported, please use a modern browser.');
+        }
+
+        // Function to get shader source from the script tags
+        function getShaderSource(id) {
+            return document.getElementById(id).textContent.trim();
+        }
+
+        // Function to compile a shader
+        function compileShader(gl, shaderSource, shaderType) {
+            const shader = gl.createShader(shaderType);
+            gl.shaderSource(shader, shaderSource);
+            gl.compileShader(shader);
+
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('Shader compilation failed:', gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+            }
+            return shader;
+        }
+
+        // Function to create the shader program
+        function createShaderProgram(gl, vertexSource, fragmentSource) {
+            const vertexShader = compileShader(gl, vertexSource, gl.VERTEX_SHADER);
+            const fragmentShader = compileShader(gl, fragmentSource, gl.FRAGMENT_SHADER);
+
+            if (!vertexShader || !fragmentShader) {
+                console.error('Shader creation failed.');
+            }
+
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertexShader);
+            gl.attachShader(shaderProgram, fragmentShader);
+            gl.linkProgram(shaderProgram);
+
+            if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+                console.error('Program linking failed:', gl.getProgramInfoLog(shaderProgram));
+                gl.deleteProgram(shaderProgram);
+            }
+            return shaderProgram;
+        }
+
+        // Get shader sources from the script tags
+        const vertexShaderSource = getShaderSource('vertexShader');
+        const fragmentShaderSource = getShaderSource('fragmentShader');
+
+        // Create the shader program
+        const shaderProgram = createShaderProgram(gl, vertexShaderSource, fragmentShaderSource);
+
+        if (!shaderProgram) {
+            console.error('Shader program creation failed.');
+        }
+
+        // Look up attribute locations
+        const positionAttributeLocation = gl.getAttribLocation(shaderProgram, 'a_position');
+
+        // Create a buffer and put a quad that covers the entire canvas
+        const positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+
+        // Define two triangles to cover the entire screen
+        const positions = new Float32Array([
+            -1.0, -1.0,
+             1.0, -1.0,
+            -1.0,  1.0,
+            -1.0,  1.0,
+             1.0, -1.0,
+             1.0,  1.0,
+        ]);
+
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+        // Setup position attribute for WebGL2
+        gl.enableVertexAttribArray(positionAttributeLocation);
+
+        gl.vertexAttribPointer(
+            positionAttributeLocation,  // Attribute location
+            2,                          // Number of components per vertex (2 for x, y)
+            gl.FLOAT,                   // Type of data (32-bit float)
+            false,                      // Normalize?
+            0,                          // Stride (0 = move forward size * sizeof(type))
+            0                           // Offset (start at beginning of buffer)
+        );
+
+        // Look up the location of the uniform variable "u_time"
+        const timeUniformLocation = gl.getUniformLocation(shaderProgram, 'u_time');
+        const resolutionUniformLocation = gl.getUniformLocation(shaderProgram, 'u_resolution');
+
+        // Resize canvas and viewport when window size changes
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // Render function
+        function render(time) {
+            // Clear the canvas
+            gl.clearColor(0.0, 0.0, 0.0, 1.0); // Clear to black
+            gl.clear(gl.COLOR_BUFFER_BIT);
+
+            // Use the shader program
+            gl.useProgram(shaderProgram);
+
+            // Pass the current time to the shader (in seconds)
+            gl.uniform1f(timeUniformLocation, time * 0.001); // Convert time to seconds
+             // Pass the canvas resolution to the shader
+            gl.uniform2f(resolutionUniformLocation, canvas.width, canvas.height);
+
+            // Draw the triangles
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            // Request the next frame
+            requestAnimationFrame(render);
+        }
+
+        // Start rendering with the animation
+        requestAnimationFrame(render);
+    </script>
+</body>
+</html>
