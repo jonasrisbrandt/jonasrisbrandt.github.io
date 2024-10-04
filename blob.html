@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>WebGL 2D Pixel Shader Animation with Bloom Effect</title>
+    <style>
+        body, html {
+            margin: 0;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="glCanvas"></canvas>
+
+    <!-- Vertex Shader (Shared by all passes) -->
+    <script id="vertexShader" type="x-shader/x-vertex">
+        #version 300 es
+        in vec2 a_position;
+        out vec2 v_uv;
+
+        void main() {
+            v_uv = a_position * 0.5 + 0.5;
+            gl_Position = vec4(a_position, 0.0, 1.0);
+        }
+    </script>
+
+    <!-- Fragment Shader (Scene Rendering) -->
+    <script id="fragmentShaderScene" type="x-shader/x-fragment">
+        #version 300 es
+        precision mediump float;
+        
+        in vec2 v_uv;
+        uniform vec2 u_resolution;
+        uniform float u_time;
+        out vec4 outColor;
+        
+        const int MAX_STEPS = 80;
+        const int NUM_BALLS = 15;
+        const float EPSILON = 0.01;
+        const float MAX_DIST = 100.0;
+        
+        // Reflection parameters
+        const int MAX_REFLECTIONS = 2;       // Maximum number of reflections
+        const float REFLECTION_FACTOR = 0.1; // Intensity of reflections
+
+        // Ambient Occlusion parameters
+        const int AO_SAMPLES = 32;
+        const float AO_STEP = 0.02;
+        const float AO_SCALE = 0.9;
+        
+        // Shadows parameters
+        const float SHADOW_BIAS = 1.0; 
+        const int SHADOW_STEPS = 64;
+        const float SHADOW_EPSILON = 0.005;
+        const float SHADOW_INTENSITY = 0.1;
+        
+        // PCF Soft Shadow parameters
+        const int PCF_SAMPLES = 2;
+        const float PCF_OFFSET = 0.05;
+        
+        // Ambient Light
+        const float AMBIENT_LIGHT = 0.15;
+        
+        // Chromatic Aberration Offset
+        const float ABERRATION_AMOUNT = 0.008;
+        
+        vec3 palette(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
+            return a + b * cos(6.28318 * (c * t * d));
+        }
+        
+        vec3 palette_fixed(float t) {
+            vec3 a = vec3(0.5, 0.5, 0.5);
+            vec3 b = vec3(0.5, 0.5, 0.5);
+            vec3 c = vec3(1.0, 0.7, 0.4);
+            vec3 d = vec3(0.0, 0.15, 0.2);
+            return palette(t, a, b, c, d);
+        }
+        
+        vec2 rot2d(vec2 v, float angle) {
+            float cosa = cos(angle);
+            float sina = sin(angle);
+            
+            mat2 rotation = mat2(
+                cosa, -sina,
+                sina,  cosa
+            );
+            
+            return rotation * v;
+        }
+        
+        float sphere(vec3 p, float r) {
+            return length(p) - r;
+        }
+        
+        float smoothUnion(float d1, float d2, float k) {
+            float h = clamp(0.5 + 0.5 * (d2 - d1) / k, 0.0, 1.0);
+            return mix(d2, d1, h) - k * h * (1.0 - h);
+        }
+        
+        float dist(vec3 p) {
+            float t = u_time * 0.7;
+            float r = 0.7;
+            float scale = 0.7;
+            float k = 0.7;
+            
+            // rotate p in xz-plane
+            p.xz = rot2d(p.xz, t + p.y * 2.0 * sin(t) * sin(p.y * 0.5 + t * 2.0));
+
+            // rotate p in yz - plane
+            p.yz = rot2d(p.yz, t * 0.5 + p.x * 0.1);
+
+            float j = 0.5;
+            vec3 pos = vec3(sin(t * 0.3 * j + j) * 1.2 + cos(t + j), 
+                           sin(t * 0.2 * j + j) * 2.0, 
+                           sin(t + j) * 1.7 + j * 0.5) * scale;
+            float s = sphere(p - pos, r);
+        
+            for (int i = 0; i < NUM_BALLS - 1; i++) {
+                j = float(i);
+                pos = vec3(sin(t * 0.3 * j + j) * 1.2 + cos(t + j), 
+                           sin(t * 0.2 * j + j) * 2.0, 
+                           sin(t + j) * 1.7 + 1.0) * scale;
+                float s1 = sphere(p - pos, r + sin(t + j * 2.0) * 0.3 + sin(t * 3.0 + j * 0.8) * 0.2);
+                s = smoothUnion(s, s1, k);
+            }
+        
+            return s;
+        
+            // Uncomment if you want a floor plane
+            // float floor = p.y + 2.5;
+            // return min(floor, s);
+        }
+
+        vec3 calcNormal(in vec3 p)
+        {
+            const vec2 h = vec2(EPSILON,0);
+            return normalize(vec3(dist(p+h.xyy) - dist(p-h.xyy),
+                                  dist(p+h.yxy) - dist(p-h.yxy),
+                                  dist(p+h.yyx) - dist(p-h.yyx)));
+        }
+
+        vec3 calcFastNormal(in vec3 p, float d)
+        {
+            const vec2 h = vec2(EPSILON,0);
+            return normalize(vec3(dist(p+h.xyy) - d,
+                                  dist(p+h.yxy) - d,
+                                  dist(p+h.yyx) - d));
+        }
+
+        vec3 calcFastNormal2( in vec3 p ) 
+        {
+            const vec2 k = vec2(1,-1);
+            return normalize(k.xyy*dist( p + k.xyy*EPSILON ) + 
+                            k.yyx*dist( p + k.yyx*EPSILON ) + 
+                            k.yxy*dist( p + k.yxy*EPSILON ) + 
+                            k.xxx*dist( p + k.xxx*EPSILON ) );
+        }
+        
+        float ambientOcclusion(vec3 p, vec3 normal) {
+            float oc = 0.0;
+            
+            float t = SHADOW_BIAS * 0.5;
+            for(int i = 1; i <= AO_SAMPLES; i++) {
+                float d = dist(p + normal * t);
+                oc += clamp((t - d) / t, 0.0, 1.0);
+                t += AO_STEP;
+            }
+
+            float ao = 1.0 - (oc / float(AO_SAMPLES)) * AO_SCALE;
+            return clamp(ao, 0.0, 1.0);
+        }
+        
+        // Hard Shadow Function
+        float hardShadow(vec3 p, vec3 lightDir) {
+            float t = SHADOW_BIAS; // Start above the surface
+            for(int i = 0; i < SHADOW_STEPS; i++) {
+                vec3 pos = p + lightDir * t;
+                float d = dist(pos);
+                if(d < SHADOW_EPSILON) {
+                    return SHADOW_INTENSITY; // In shadow
+                }
+                t += d;
+                if(t > MAX_DIST) break; // Exceeded max distance
+            }
+            return 1.0; // Fully lit
+        }
+        
+        // Soft Shadow Function using SDF-based Raymarching
+        float softShadow(vec3 p, vec3 lightDir) {
+            float k = 7.0;
+
+            float t = SHADOW_BIAS; // Start above the surface
+            float res = 1.0;
+            for(int i = 0; i < SHADOW_STEPS; i++) {
+                vec3 pos = p + lightDir * t;
+
+                float d = dist(pos);
+                if(d < SHADOW_EPSILON) {
+                    return SHADOW_INTENSITY; // In shadow
+                }
+                res = min(res, k*d/t);
+                t += d;
+                if(t > MAX_DIST) break; // Exceeded max distance
+            }
+            return max(res, SHADOW_INTENSITY);
+        }
+        
+        // PCF Soft Shadow Function
+        float pcfHardShadow(vec3 p, vec3 lightDir) {
+            float shadow = 0.0;
+            int samples = PCF_SAMPLES;
+            float offset = PCF_OFFSET;
+        
+            for(int x = -samples; x <= samples; x++) {
+                for(int y = -samples; y <= samples; y++) {
+                    // Perturb light direction
+                    vec3 perturbedDir = normalize(lightDir + vec3(float(x) * offset, float(y) * offset, 0.0));
+                    shadow += hardShadow(p, perturbedDir);
+                }
+            }
+        
+            // Average the shadow results
+            shadow /= float((samples * 2 + 1) * (samples * 2 + 1));
+            return shadow;
+        }
+
+        // Raymarching function with iterative reflection
+        vec4 raymarch2(vec2 uv, vec3 ro, vec3 rd) {
+            vec3 col = vec3(0.0);
+            vec3 accumulatedColor = vec3(0.0);
+            vec3 currentOrigin = ro;
+            vec3 currentDir = rd;
+            float reflectionContribution = 1.0;
+            float depth = MAX_DIST;
+            
+            for(int reflection = 0; reflection <= MAX_REFLECTIONS; reflection++) {
+                float t = 0.0; // Total distance traveled
+                bool hit = false;
+                vec3 hitPoint;
+                vec3 normal;
+                
+                // Perform raymarching
+                for (int i = 0; i < MAX_STEPS; i++) {
+                    vec3 p = currentOrigin + currentDir * t;
+                    float d = dist(p); // Distance to scene
+                    if (d < EPSILON) {
+                        hit = true;
+                        hitPoint = p;
+                        
+                        // Compute normals using central differences
+                        normal = calcFastNormal(p, d);
+
+                        if (reflection == 0) {
+                            depth = t;
+                        }
+                        break;
+                    }
+                    t += d; // Step along the ray
+                    if(t > MAX_DIST) break;
+                }
+                
+                if(hit) {
+                    // Compute Ambient Occlusion
+                    float ao = ambientOcclusion(hitPoint, normal);
+        
+                    //return vec3(ao);
+
+                    // Define Light Direction
+                    vec3 lightDir = normalize(vec3(1.0, 1.0, -1.0));
+            
+                    // Compute Shadows
+                    float sh = softShadow(hitPoint, lightDir);
+
+                    //return vec3(sh);
+
+                    // Define diffuse Color
+                    vec3 diffuseColor = vec3(0.8, 0.6, 0.9);
+
+                    // Compute Lighting (Diffuse)
+                    float lighting = max(dot(normal, lightDir), 0.0);
+            
+                    // Compute Specular Lighting using Blinn-Phong
+                    vec3 viewDir = normalize(currentOrigin - hitPoint);
+                    vec3 halfVector = normalize(lightDir + viewDir);
+                    float specAngle = max(dot(halfVector, normal), 0.0);
+                    float specular = pow(specAngle, 32.0); // Shininess factor
+            
+                    // Define Specular Color
+                    vec3 specularColor = vec3(0.8, 0.6, 0.9);
+            
+                    // Combine Specular with Lighting and Shadows
+                    float spec = specular * sh;
+            
+                    // Define Albedo (Base Color)
+                    vec3 albedo = palette_fixed(length(t * 2.0) * sin(u_time * 0.5));
+            
+                    // Combine Diffuse, Specular, and Ambient
+                    vec3 diffuse = diffuseColor * lighting * albedo * sh;
+                    vec3 finalSpecular = specularColor * spec * 0.7;
+                    vec3 ambient = AMBIENT_LIGHT * ao * albedo;
+            
+                    // Local color at hit point
+                    vec3 localColor = diffuse + finalSpecular + ambient;
+            
+                    // Accumulate color with reflection contribution
+                    accumulatedColor += localColor * reflectionContribution;
+            
+                    // Prepare for reflection
+                    if(reflection < MAX_REFLECTIONS) {
+                        // Compute reflection direction
+                        currentDir = reflect(currentDir, normal);
+                        
+                        // Offset the origin to prevent self-intersection
+                        currentOrigin = hitPoint + normal * EPSILON * 2.0;
+                        
+                        // Update reflection contribution
+                        reflectionContribution *= REFLECTION_FACTOR;
+                    }
+
+                } else {
+                    // No hit, accumulate background color
+                    vec3 backgroundColor = vec3(0.05, 0.05, 0.2) - vec3(0.15, 0.15, 0.3) * uv.y;
+                    accumulatedColor += backgroundColor * reflectionContribution;
+                    break;
+                }
+            }
+            
+            col = accumulatedColor;
+            return vec4(col, 1.0 - depth / MAX_DIST * 10.0);
+        }
+
+        // Raymarching function for chromatic aberration
+        vec4 raymarch(vec2 uv) {
+            vec3 ro = vec3(0.0, 0.0, -5.0);         // Ray origin
+            vec3 rd = normalize(vec3(uv, 1.0));     // Ray direction
+
+            //return rd;
+
+            return raymarch2(uv, ro, rd);
+        }
+       
+        void main() {
+            vec2 uv = v_uv * 2.0 - 1.0;
+            uv.x *= u_resolution.x / u_resolution.y;
+            outColor = raymarch(uv);
+        }
+
+    </script>
+
+    <!-- Fragment Shader (Bright Pass) -->
+    <script id="fragmentShaderBright" type="x-shader/x-fragment">
+        #version 300 es
+        precision mediump float;
+
+        in vec2 v_uv;
+        uniform sampler2D u_scene;
+        uniform float u_threshold;
+        out vec4 outColor;
+
+        void main() {
+            vec3 color = texture(u_scene, v_uv).rgb;
+            float brightness = dot(color, vec3(0.2126, 0.7152, 0.0722));
+            if (brightness > u_threshold) {
+                outColor = vec4(color, 1.0);
+            } else {
+                outColor = vec4(0.0);
+            }
+        }
+    </script>
+
+    <!-- Fragment Shader (Downsample Bright Pass) -->
+    <script id="fragmentShaderDownsample" type="x-shader/x-fragment">
+        #version 300 es
+        precision mediump float;
+
+        in vec2 v_uv;
+        uniform sampler2D u_bright;
+        out vec4 outColor;
+
+        void main() {
+            // Simple downsampling using texture filtering
+            vec3 color = texture(u_bright, v_uv).rgb;
+            outColor = vec4(color, 1.0);
+        }
+    </script>
+
+    <!-- Fragment Shader (Optimized Gaussian Blur Horizontal) -->
+    <script id="fragmentShaderBlurHorizontalOptimized" type="x-shader/x-fragment">
+        #version 300 es
+        precision mediump float;
+
+        in vec2 v_uv;
+        uniform sampler2D u_image;
+        uniform vec2 u_texelSize;
+        out vec4 outColor;
+
+        void main() {
+            // Gaussian weights with larger offsets
+            float kernel[5];
+            kernel[0] = 0.2270270270;
+            kernel[1] = 0.1945945946;
+            kernel[2] = 0.1216216216;
+            kernel[3] = 0.0540540541;
+            kernel[4] = 0.0162162162;
+
+            vec3 color = texture(u_image, v_uv).rgb * kernel[2];
+            color += texture(u_image, v_uv + vec2(-2.0 * u_texelSize.x, 0.0)).rgb * kernel[0];
+            color += texture(u_image, v_uv + vec2(-1.0 * u_texelSize.x, 0.0)).rgb * kernel[1];
+            color += texture(u_image, v_uv + vec2(1.0 * u_texelSize.x, 0.0)).rgb * kernel[3];
+            color += texture(u_image, v_uv + vec2(2.0 * u_texelSize.x, 0.0)).rgb * kernel[4];
+
+            outColor = vec4(color, 1.0);
+        }
+    </script>
+
+    <!-- Fragment Shader (Optimized Gaussian Blur Vertical) -->
+    <script id="fragmentShaderBlurVerticalOptimized" type="x-shader/x-fragment">
+        #version 300 es
+        precision mediump float;
+
+        in vec2 v_uv;
+        uniform sampler2D u_image;
+        uniform vec2 u_texelSize;
+        out vec4 outColor;
+
+        void main() {
+            // Gaussian weights with larger offsets
+            float kernel[5];
+            kernel[0] = 0.2270270270;
+            kernel[1] = 0.1945945946;
+            kernel[2] = 0.1216216216;
+            kernel[3] = 0.0540540541;
+            kernel[4] = 0.0162162162;
+
+            vec3 color = texture(u_image, v_uv).rgb * kernel[2];
+            color += texture(u_image, v_uv + vec2(0.0, -2.0 * u_texelSize.y)).rgb * kernel[0];
+            color += texture(u_image, v_uv + vec2(0.0, -1.0 * u_texelSize.y)).rgb * kernel[1];
+            color += texture(u_image, v_uv + vec2(0.0, 1.0 * u_texelSize.y)).rgb * kernel[3];
+            color += texture(u_image, v_uv + vec2(0.0, 2.0 * u_texelSize.y)).rgb * kernel[4];
+
+            outColor = vec4(color, 1.0);
+        }
+    </script>
+
+    <!-- Fragment Shader (Combine Scene and Bloom) -->
+    <script id="fragmentShaderCombine" type="x-shader/x-fragment">
+        #version 300 es
+        precision mediump float;
+
+        in vec2 v_uv;
+        uniform sampler2D u_scene;
+        uniform sampler2D u_bloom;
+        uniform float u_bloomIntensity;
+        uniform vec2 u_resolution;
+        out vec4 outColor;
+        
+        void main() {
+
+            vec2 gd = texture(u_scene, v_uv).ga;
+
+            float g = gd.x;
+            float depth = gd.y;
+
+            //outColor = vec4(depth, depth, depth, 1.0);
+
+            float abbr = 0.009 * depth;
+			
+			// Define chromatic offsets for each color channel
+            vec2 offsetR = vec2(-abbr, 0.0); // Red shifted left
+            vec2 offsetB = vec2(abbr, 0.0);  // Blue shifted right
+
+            float r = texture(u_scene, v_uv + offsetR).r;
+            float b = texture(u_scene, v_uv + offsetB).b;
+
+            vec3 sceneColor = vec3(r,g,b);
+
+            vec3 bloomColor = texture(u_bloom, v_uv).rgb;
+            outColor = vec4(sceneColor + bloomColor * u_bloomIntensity, 1.0);
+        }
+    </script>
+
+    <script type="text/javascript">
+        // Get the canvas element
+        const canvas = document.getElementById('glCanvas');
+
+        // Set the canvas to full window size
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        // Initialize the WebGL2 context with anti-aliasing enabled
+        const gl = canvas.getContext('webgl2', { antialias: true });
+
+        if (!gl) {
+            console.error('WebGL2 not supported, please use a modern browser.');
+        }
+
+        // Function to get shader source from the script tags
+        function getShaderSource(id) {
+            console.log(id);
+            return document.getElementById(id).textContent.trim();
+        }
+
+        // Function to compile a shader
+        function compileShader(gl, shaderSource, shaderType) {
+            const shader = gl.createShader(shaderType);
+            gl.shaderSource(shader, shaderSource);
+            gl.compileShader(shader);
+
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('Shader compilation failed:', gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        // Function to create the shader program
+        function createShaderProgram(gl, vertexSource, fragmentSource) {
+            const vertexShader = compileShader(gl, vertexSource, gl.VERTEX_SHADER);
+            const fragmentShader = compileShader(gl, fragmentSource, gl.FRAGMENT_SHADER);
+
+            if (!vertexShader || !fragmentShader) {
+                console.error('Shader creation failed.');
+                return null;
+            }
+
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertexShader);
+            gl.attachShader(shaderProgram, fragmentShader);
+            gl.linkProgram(shaderProgram);
+
+            if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+                console.error('Program linking failed:', gl.getProgramInfoLog(shaderProgram));
+                gl.deleteProgram(shaderProgram);
+                return null;
+            }
+            return shaderProgram;
+        }
+
+        // Get shader sources from the script tags
+        const vertexShaderSource = getShaderSource('vertexShader');
+        const fragmentShaderSourceScene = getShaderSource('fragmentShaderScene');
+        const fragmentShaderSourceBright = getShaderSource('fragmentShaderBright');
+        const fragmentShaderSourceDownsample = getShaderSource('fragmentShaderDownsample');
+        const fragmentShaderSourceBlurHOpt = getShaderSource('fragmentShaderBlurHorizontalOptimized');
+        const fragmentShaderSourceBlurVOpt = getShaderSource('fragmentShaderBlurVerticalOptimized');
+        const fragmentShaderSourceCombine = getShaderSource('fragmentShaderCombine');
+
+        // Create shader programs
+        const shaderProgramScene = createShaderProgram(gl, vertexShaderSource, fragmentShaderSourceScene);
+        const shaderProgramBright = createShaderProgram(gl, vertexShaderSource, fragmentShaderSourceBright);
+        const shaderProgramDownsample = createShaderProgram(gl, vertexShaderSource, fragmentShaderSourceDownsample);
+        const shaderProgramBlurHOpt = createShaderProgram(gl, vertexShaderSource, fragmentShaderSourceBlurHOpt);
+        const shaderProgramBlurVOpt = createShaderProgram(gl, vertexShaderSource, fragmentShaderSourceBlurVOpt);
+        const shaderProgramCombine = createShaderProgram(gl, vertexShaderSource, fragmentShaderSourceCombine);
+
+        if (!shaderProgramScene || !shaderProgramBright || !shaderProgramDownsample || !shaderProgramBlurHOpt || !shaderProgramBlurVOpt || !shaderProgramCombine) {
+            console.error('One or more shader programs failed to compile/link.');
+        }
+
+        // Look up attribute locations (shared by all programs)
+        const positionAttributeLocation = gl.getAttribLocation(shaderProgramScene, 'a_position');
+
+        // Create a buffer and put a quad that covers the entire canvas
+        const positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+
+        // Define two triangles to cover the entire screen
+        const positions = new Float32Array([
+            -1.0, -1.0,
+             1.0, -1.0,
+            -1.0,  1.0,
+            -1.0,  1.0,
+             1.0, -1.0,
+             1.0,  1.0,
+        ]);
+
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+        // Setup position attribute for all shader programs
+        function setupAttributes(program) {
+            const positionLocation = gl.getAttribLocation(program, 'a_position');
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.enableVertexAttribArray(positionLocation);
+            gl.vertexAttribPointer(
+                positionLocation,  // Attribute location
+                2,                 // Number of components per vertex (2 for x, y)
+                gl.FLOAT,          // Type of data (32-bit float)
+                false,             // Normalize?
+                0,                 // Stride (0 = move forward size * sizeof(type))
+                0                  // Offset (start at beginning of buffer)
+            );
+        }
+
+        // Create textures and framebuffers for multiple passes
+        function createTexture(width, height, internalFormat, format, type) {
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, width, height, 0, format, type, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            return texture;
+        }
+
+        function createFramebuffer(texture) {
+            const fbo = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+            return fbo;
+        }
+
+        // Initial framebuffer size
+        let width = gl.canvas.width;
+        let height = gl.canvas.height;
+
+        const downsample_scale = 4;
+        let newDownsampleWidth = Math.floor(width / downsample_scale);
+        let newDownsampleHeight = Math.floor(height / downsample_scale);
+
+        // Create textures
+        const textureScene = createTexture(width, height, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+        const textureBright = createTexture(width, height, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+        const textureBrightDownsample = createTexture(newDownsampleWidth, newDownsampleHeight, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+        const textureBlur1 = createTexture(newDownsampleWidth, newDownsampleHeight, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+        const textureBlur2 = createTexture(newDownsampleWidth, newDownsampleHeight, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+        const textureBlurUpscaled = createTexture(width, height, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+
+        // Create framebuffers
+        const fboScene = createFramebuffer(textureScene);
+        const fboBright = createFramebuffer(textureBright);
+        const fboBrightDownsample = createFramebuffer(textureBrightDownsample);
+        const fboBlur1 = createFramebuffer(textureBlur1);
+        const fboBlur2 = createFramebuffer(textureBlur2);
+        const fboBlurUpscaled = createFramebuffer(textureBlurUpscaled);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null); // Unbind any framebuffer
+
+        // Look up uniform locations for each shader program
+        // Scene shader uniforms
+        const uniformLocationsScene = {
+            resolution: gl.getUniformLocation(shaderProgramScene, 'u_resolution'),
+            time: gl.getUniformLocation(shaderProgramScene, 'u_time'),
+        };
+
+        // Bright pass shader uniforms
+        const uniformLocationsBright = {
+            scene: gl.getUniformLocation(shaderProgramBright, 'u_scene'),
+            threshold: gl.getUniformLocation(shaderProgramBright, 'u_threshold'),
+        };
+
+        // Downsample shader uniforms
+        const uniformLocationsDownsample = {
+            bright: gl.getUniformLocation(shaderProgramDownsample, 'u_bright'),
+        };
+
+        // Optimized Blur shaders uniforms
+        const uniformLocationsBlurHOpt = {
+            image: gl.getUniformLocation(shaderProgramBlurHOpt, 'u_image'),
+            texelSize: gl.getUniformLocation(shaderProgramBlurHOpt, 'u_texelSize'),
+        };
+        const uniformLocationsBlurVOpt = {
+            image: gl.getUniformLocation(shaderProgramBlurVOpt, 'u_image'),
+            texelSize: gl.getUniformLocation(shaderProgramBlurVOpt, 'u_texelSize'),
+        };
+
+        // Combine shader uniforms
+        const uniformLocationsCombine = {
+            scene: gl.getUniformLocation(shaderProgramCombine, 'u_scene'),
+            bloom: gl.getUniformLocation(shaderProgramCombine, 'u_bloom'),
+            bloomIntensity: gl.getUniformLocation(shaderProgramCombine, 'u_bloomIntensity'),
+            resolution: gl.getUniformLocation(shaderProgramScene, 'u_resolution'),
+        };
+
+        // Resize canvas and related resources when window size changes
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+            // Update sizes
+            width = gl.canvas.width;
+            height = gl.canvas.height;
+
+            newDownsampleWidth = Math.floor(width / downsample_scale);
+            newDownsampleHeight = Math.floor(height / downsample_scale);
+
+            // Resize existing textures
+            gl.bindTexture(gl.TEXTURE_2D, textureScene);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.bindTexture(gl.TEXTURE_2D, textureBright);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.bindTexture(gl.TEXTURE_2D, textureBrightDownsample);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, newDownsampleWidth, newDownsampleHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.bindTexture(gl.TEXTURE_2D, textureBlur1);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, newDownsampleWidth, newDownsampleHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.bindTexture(gl.TEXTURE_2D, textureBlur2);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, newDownsampleWidth, newDownsampleHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.bindTexture(gl.TEXTURE_2D, textureBlurUpscaled);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // Render function
+        function render(time) {
+            // Clear the canvas
+            gl.clearColor(0.0, 0.0, 0.0, 1.0); // Clear to black
+            gl.clear(gl.COLOR_BUFFER_BIT);
+
+            // ----- Pass 1: Render Scene to textureScene -----
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fboScene);
+            gl.viewport(0, 0, width, height);
+            gl.useProgram(shaderProgramScene);
+            setupAttributes(shaderProgramScene);
+
+            // Set uniforms
+            gl.uniform2f(uniformLocationsScene.resolution, width, height);
+            gl.uniform1f(uniformLocationsScene.time, time * 0.001); // Convert to seconds
+
+            // Draw the scene
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            // ----- Pass 2: Bright Pass (Extract bright areas) -----
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fboBright);
+            gl.viewport(0, 0, width, height);
+            gl.useProgram(shaderProgramBright);
+            setupAttributes(shaderProgramBright);
+
+            // Bind the scene texture
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, textureScene);
+            gl.uniform1i(uniformLocationsBright.scene, 0);
+            gl.uniform1f(uniformLocationsBright.threshold, 0.5); // Adjust threshold as needed
+
+            // Draw the bright pass
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            // ----- Pass 2.5: Downsample Bright Pass to Lower Resolution -----
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fboBrightDownsample);
+            gl.viewport(0, 0, newDownsampleWidth, newDownsampleHeight);
+            gl.useProgram(shaderProgramDownsample);
+            setupAttributes(shaderProgramDownsample);
+
+            // Bind the bright texture
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, textureBright);
+            gl.uniform1i(uniformLocationsDownsample.bright, 0);
+
+            // Draw the downsampled bright pass
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            // ----- Pass 3: Optimized Gaussian Blur Horizontal on Downsampled Texture -----
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fboBlur1);
+            gl.viewport(0, 0, newDownsampleWidth, newDownsampleHeight);
+            gl.useProgram(shaderProgramBlurHOpt);
+            setupAttributes(shaderProgramBlurHOpt);
+
+            // Bind the downsampled bright texture
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, textureBrightDownsample);
+            gl.uniform1i(uniformLocationsBlurHOpt.image, 0);
+            gl.uniform2f(uniformLocationsBlurHOpt.texelSize, 1.0 / newDownsampleWidth, 1.0 / newDownsampleHeight);
+
+            // Draw the horizontal blur
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            // ----- Pass 4: Optimized Gaussian Blur Vertical on Downsampled Texture -----
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fboBlur2);
+            gl.viewport(0, 0, newDownsampleWidth, newDownsampleHeight);
+            gl.useProgram(shaderProgramBlurVOpt);
+            setupAttributes(shaderProgramBlurVOpt);
+
+            // Bind the horizontally blurred texture
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, textureBlur1);
+            gl.uniform1i(uniformLocationsBlurVOpt.image, 0);
+            gl.uniform2f(uniformLocationsBlurVOpt.texelSize, 1.0 / newDownsampleWidth, 1.0 / newDownsampleHeight);
+
+            // Draw the vertical blur
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            // ----- Pass 5: Combine Scene and Upscaled Bloom -----
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null); // Render to screen
+            gl.viewport(0, 0, width, height);
+            gl.useProgram(shaderProgramCombine);
+            setupAttributes(shaderProgramCombine);
+
+            // Bind the scene texture
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, textureScene);
+            gl.uniform1i(uniformLocationsCombine.scene, 0);
+
+            // Bind the blurred and upscaled bloom texture
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, textureBlur2);
+            gl.uniform1i(uniformLocationsCombine.bloom, 1);
+
+            // Set bloom intensity
+            gl.uniform1f(uniformLocationsCombine.bloomIntensity, 1.5); // Adjust as needed
+
+            // Draw the final combined image
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            // Request the next frame
+            requestAnimationFrame(render);
+        }
+
+        // Start rendering with the animation
+        requestAnimationFrame(render);
+    </script>
+</body>
+</html>
