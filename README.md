@@ -26,6 +26,7 @@ GitHub Pages publishes the repository root from `master`. Commit and push change
 
 - `index.html`: visible content, styles, the hero shader and its runner, title/description, canonical URL, social metadata and ProfilePage/Person JSON-LD. Experience years are derived from the start years (1986 and 1998) at runtime; the HTML carries the current values for crawlers.
 - `assets/favicon.svg`: site icon.
+- `assets/og-image.jpg`: 1200×630 share image (Open Graph and Twitter card), rendered from the hero shader.
 - `robots.txt`: crawler access and sitemap location.
 - `sitemap.xml`: the current personal landing page. Update `lastmod` only when the page changes meaningfully.
 
